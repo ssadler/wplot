@@ -2,6 +2,7 @@
 
 import fcntl
 import optparse
+import os
 import os.path
 import random
 import socket
@@ -217,6 +218,7 @@ def get_args():
     parser.add_option('-p', '--port', dest='port', type="int",
                       default=random.randint(30000, 50000))
     parser.add_option('-r', '--realtime', action='store_true')
+    parser.add_option('-b', '--browse', action='store_true')
     return parser.parse_args()
 
 
@@ -253,7 +255,9 @@ def main():
     def announce():
         print >>sys.stderr, "wplot running at: " + url
     
-    ioloop.add_callback(lambda: webbrowser.open_new_tab(url))
+    if options.browse:
+        ioloop.add_callback(lambda: webbrowser.open_new_tab(url))
+    
     ioloop.add_callback(announce)
     
     try:
