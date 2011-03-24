@@ -104,13 +104,14 @@ class Application(tornado.web.Application):
         self.ioloop = tornado.ioloop.IOLoop.instance()
         self.options = options
         self.series = series
+        self._stop = False
         
         super(Application, self).__init__(*args, **kwargs)
 
         Thread(target=self._read_input).start()
     
     def _read_input(self):
-        while True:
+        while not self._stop:
             data = sys.stdin.readline()
             if data == '':
                 break
@@ -247,8 +248,7 @@ def main():
     except IOError:
         ip = '127.0.0.1'
 
-    http_server = tornado.httpserver.HTTPServer(application, io_loop=ioloop)
-    http_server.listen(options.port, ip)
+    tornado.httpserver.HTTPServer(application).listen(options.port, ip)
     
     url = 'http://%s:%s/' % (ip, options.port)
     
@@ -264,6 +264,8 @@ def main():
         ioloop.start()
     except (KeyboardInterrupt, IOError) as e:
         pass
+    finally:
+        application._stop = True
 
 
 if __name__ == '__main__':
