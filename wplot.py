@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import fcntl
 import optparse
 import os.path
@@ -7,6 +9,8 @@ import struct
 import sys
 import time
 import webbrowser
+from functools import partial
+from threading import Thread
 
 try:
     import tornado.web, tornado.ioloop, tornado.httpserver
@@ -46,27 +50,13 @@ tpl_index = """<html>
 </div>
 <script type="text/javascript">
 var updates = 0;
-var chartOpts = {
-    series: {
-        points: {
-            show: false,
-        },
-        lines: {
-            fill: true,
-            fillColor: "rgba(100, 100, 100, .5)",
-            lineWidth: 0
-        }
-    },
-    xaxis: {
-        max: 0,
-        min: %(chart_min)s,
-    },
-};
+var chartOpts = %(chart_opts)s;
+var seriesPrep = (%(series_prep)s);
 $.plot($("#chartdiv"), [], chartOpts);
 
 (function() {
     $.getJSON('/update', function(data) {
-        $.plot($("#chartdiv"), [data], chartOpts);
+        $.plot($("#chartdiv"), [seriesPrep(data)], chartOpts);
         if (++updates == 10)
             window.location.href=window.location.href;
     });
@@ -86,9 +76,18 @@ class IndexHandler(tornado.web.RequestHandler):
         if options.interval:
             chart_min = options.length * options.interval * -1
         
+        chart_max = 0
+        if not options.realtime:
+            chart_max = None
+        
+        chart_opts = self.application.series.get_chart_opts()
+        
         out = tpl_index % {
             'title': (self.application.options.title or ''),
             'chart_min': json_encode(chart_min),
+            'chart_max': json_encode(chart_max),
+            'chart_opts': json_encode(chart_opts),
+            'series_prep': chart_opts['series_prep'],
         }
         self.write(out)
 
@@ -96,54 +95,88 @@ class IndexHandler(tornado.web.RequestHandler):
 class UpdateHandler(tornado.web.RequestHandler):
     def get(self):
         self.set_header("Content-type", "application/json")
-        
-        now = time.time()
-        values = [(t-now, i) for t, i in self.application.series]
-        
-        self.write(json_encode(values))
+        self.write(json_encode(list(self.application.series)))
 
 
 class Application(tornado.web.Application):
-    def __init__(self, options, *args, **kwargs):
+    def __init__(self, options, series, *args, **kwargs):
         self.ioloop = tornado.ioloop.IOLoop.instance()
         self.options = options
-        self.series = self._get_series()
-        
-        self.ioloop.add_handler(sys.stdin.fileno(), self._handle_input,
-                                self.ioloop.READ | self.ioloop.ERROR)
+        self.series = series
         
         super(Application, self).__init__(*args, **kwargs)
+
+        Thread(target=self._read_input).start()
     
-    def _get_series(self):
-        if self.options.interval:
-            cls = IntervalSeries
-        else:
-            cls = LiteralSeries
-        return cls(self)
-    
-    def _handle_input(self, fileno, events):
-        if events & self.ioloop.ERROR:
-            self.ioloop.stop()
-        else:
-            data = sys.stdin.readline().strip()
-            self.series.append(data)
+    def _read_input(self):
+        while True:
+            data = sys.stdin.readline()
+            if data == '':
+                break
+            cb = partial(self.series.append, data.strip())
+            self.ioloop.add_callback(cb)
+
+
+BASE_CHART_OPTS = {
+    'series': {
+        'points': {
+            'show': False,
+        },
+        'lines': {
+            'fill': True,
+            'fillColor': "rgba(100, 100, 100, .5)",
+            'lineWidth': 0
+        }
+    },
+    'xaxis': {},
+    'series_prep': 'function(s) { return s; }',
+}
+
 
 
 class Series(list):
-    def __init__(self, application, *args):
-        self.application = application
+    def __init__(self, options, ioloop, *args):
+        self.options = options
+        self.ioloop = ioloop
         super(Series, self).__init__(*args)
 
+    def get_chart_opts(self):
+        return BASE_CHART_OPTS
+    
+    def __repr__(self):
+        return "<%s>" % self.__class__.__name__
 
-class IntervalSeries(Series):
-    def __init__(self, application):
-        
-        interval = application.options.interval
-        length = application.options.length
-        now = time.time()
-        
-        super(IntervalSeries, self).__init__(application)
 
+class LiteralSeries(Series):
+    def append(self, data):
+        try:
+            val = float(data)
+        except:
+            val = None
+        super(LiteralSeries, self).append(val)
+
+        if len(self) > self.options.length:
+            self.pop(0)
+    
+    def __iter__(self):
+        return enumerate(Series.__iter__(self))
+
+class BaseRealtimeSeries(Series):
+    def get_chart_opts(self):
+        BASE_CHART_OPTS['xaxis']['mode'] = 'time'
+        BASE_CHART_OPTS['series_prep'] =\
+        """ function(s) {
+                var ns = [];
+                for (var i=0; i<s.length; i++) {
+                    ns.push([s[i][0]*1000, s[i][1]]);
+                }
+            return ns;
+        }"""
+        return BASE_CHART_OPTS
+
+class RealtimeIntervalSeries(BaseRealtimeSeries):
+    def __init__(self, options, ioloop):
+        super(IntervalSeries, self).__init__(options, ioloop)
         self._update()
     
     def append(self, data):
@@ -154,24 +187,24 @@ class IntervalSeries(Series):
         self[-1][1] += val
     
     def _update(self):
-        super(IntervalSeries, self).append([time.time(), 0])
+        super(RealtimeIntervalSeries, self).append([time.time(), 0])
         
-        if len(self) > self.application.options.length:
+        if len(self) > self.options.length:
             self.pop(0)
         
-        timeout = time.time() + self.application.options.interval
-        self.application.ioloop.add_timeout(timeout, self._update)
+        timeout = time.time() + self.options.interval
+        self.ioloop.add_timeout(timeout, self._update)
         
 
-class LiteralSeries(Series):
+class RealtimeLiteralSeries(BaseRealtimeSeries):
     def append(self, data):
         try:
             val = float(data)
         except:
             val = None
-        super(LiteralSeries, self).append([time.time(), val])
+        super(RealtimeLiteralSeries, self).append([time.time(), val])
 
-        if len(self) > self.application.options.length:
+        if len(self) > self.options.length:
             self.pop(0)
 
 
@@ -183,13 +216,26 @@ def get_args():
     parser.add_option('-l', '--length', dest='length', type="int", default=300)
     parser.add_option('-p', '--port', dest='port', type="int",
                       default=random.randint(30000, 50000))
+    parser.add_option('-r', '--realtime', action='store_true')
     return parser.parse_args()
+
+
+def get_series_class(options):
+    if options.realtime:
+        if options.interval:
+            return RealtimeIntervalSeries
+        return RealtimeLiteralSeries
+    return LiteralSeries
 
 
 def main():
     options, args = get_args()
     
-    application = Application(options, [
+    ioloop = tornado.ioloop.IOLoop.instance()
+    
+    series = get_series_class(options)(options, ioloop)
+    
+    application = Application(options, series, [
         ('/', IndexHandler),
         ('/update', UpdateHandler),
     ], static_path=STATIC_PATH)
@@ -199,19 +245,19 @@ def main():
     except IOError:
         ip = '127.0.0.1'
 
-    http_server = tornado.httpserver.HTTPServer(application)
-    http_server.listen(options.port)
+    http_server = tornado.httpserver.HTTPServer(application, io_loop=ioloop)
+    http_server.listen(options.port, ip)
     
     url = 'http://%s:%s/' % (ip, options.port)
     
     def announce():
         print >>sys.stderr, "wplot running at: " + url
     
-    application.ioloop.add_callback(lambda: webbrowser.open_new_tab(url))
-    application.ioloop.add_callback(announce)
+    ioloop.add_callback(lambda: webbrowser.open_new_tab(url))
+    ioloop.add_callback(announce)
     
     try:
-        application.ioloop.start()
+        ioloop.start()
     except (KeyboardInterrupt, IOError) as e:
         pass
 
